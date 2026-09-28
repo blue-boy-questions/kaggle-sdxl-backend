@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  backend:
+    name: Backend tests (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test deps
+        run: pip install fastapi httpx pytest requests
+      - name: Run backend tests
+        # OUTPUT_DIR defaults to /content (Colab-only) and is created at import
+        # time, so redirect it to a writable temp dir for CI.
+        env:
+          OUTPUT_DIR: ${{ runner.temp }}/sdxl_outputs
+        run: pytest -q tests/test_backend.py
+
+  worker:
+    name: Worker tests (node --test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Syntax check
+        run: node --check worker/src/index.js
+      - name: Run worker tests
+        run: node --test tests/worker.test.mjs
