@@ -18,6 +18,7 @@ def test_health_reports_unloaded_model():
             "ok": True,
             "model_loaded": False,
             "queue_size": 0,
+            "device": "cpu",
         }
 
 
