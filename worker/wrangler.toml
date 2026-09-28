@@ -9,6 +9,10 @@ binding = "BACKEND_KV"
 # TELEGRAM_BOT_TOKEN
 # TELEGRAM_WEBHOOK_SECRET
 # REGISTRATION_SECRET
+# Kaggle API (optional — enables the /wake button to remotely start the notebook):
+# KAGGLE_USERNAME
+# KAGGLE_KEY
+# KAGGLE_KERNEL   e.g. "masoodkaviri/kaggle-backend"
 
 # Optional comma-separated Telegram numeric user IDs:
 # [vars]

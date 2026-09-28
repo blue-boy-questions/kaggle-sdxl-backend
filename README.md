@@ -80,9 +80,21 @@ busy so the tunnel stays registered. Interrupt it to shut down.
 - Tap **🎨 Generate**, then send your prompt as the next message.
 - `/generate <prompt>` — one-shot generation.
 - **📊 Status** — backend online/offline + current device.
-- **🐢 Switch to CPU / ⚡ Switch to GPU** — flip the render device at runtime.
-  CPU is free and burns no GPU quota but takes minutes per image; GPU is fast.
+- **🐢 Wake (CPU, free) / ⚡ Wake (GPU, fast)** — remotely start the Kaggle
+  notebook via the Kaggle API (needs `KAGGLE_*` secrets). CPU burns no GPU quota.
+  Also `/wake` and `/wake gpu`.
+- **🛑 Stop session** — shut the backend process down so the Kaggle run ends and
+  quota stops. Also `/stop`.
+- **🐢 Switch to CPU / ⚡ Switch to GPU** — flip the render device at runtime
+  without reloading (only while a session is live).
 - **🖼 Open Web App** — opens the Gradio UI as a Telegram Mini App (private chat).
+
+### Notes on quota
+- **CPU is free on Kaggle** (no GPU-quota clock), but each SDXL image takes
+  minutes. GPU is fast but spends the ~30h/week GPU quota.
+- `/wake` starts a **batch run** (Save & Run All), not an interactive session:
+  it opens the tunnel, registers, and runs until the keep-alive cell hits
+  Kaggle's max runtime — so use **🛑 Stop** when you're done to free resources.
 
 ## Model is NOT in this repo
 

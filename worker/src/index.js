@@ -73,12 +73,75 @@ export function mainMenu(env, backend) {
     const label = dev === "cpu" ? "🐢 Switch to CPU (free)" : "⚡ Switch to GPU";
     rows.push([{ text: label, callback_data: `dev:${dev}` }]);
     rows.push([{ text: "🖼 Open Web App", web_app: { url: `${backend.url}/app` } }]);
+    rows.push([{ text: "🛑 Stop session", callback_data: "stop" }]);
+  } else if (kaggleConfigured(env)) {
+    // No backend live, but we can remotely start one via the Kaggle API.
+    rows.push([{ text: "🐢 Wake (CPU, free)", callback_data: "wake:cpu" }]);
+    rows.push([{ text: "⚡ Wake (GPU, fast)", callback_data: "wake:gpu" }]);
   } else {
     const colab = (env.COLAB_NOTEBOOK_URL || "").trim();
     if (colab) rows.push([{ text: "▶️ Start backend (Kaggle/Colab)", url: colab }]);
   }
   return { reply_markup: { inline_keyboard: rows } };
 }
+
+function kaggleConfigured(env) {
+  return Boolean(env.KAGGLE_USERNAME && env.KAGGLE_KEY && env.KAGGLE_KERNEL);
+}
+
+// --- Kaggle API helpers (kernels pull/push to remotely start a batch run) ---
+function kaggleAuth(env) {
+  return "Basic " + btoa(`${env.KAGGLE_USERNAME}:${env.KAGGLE_KEY}`);
+}
+
+async function kaggleGet(env, path) {
+  const r = await fetch(`https://www.kaggle.com/api/v1${path}`, {
+    headers: { authorization: kaggleAuth(env), accept: "application/json" },
+    signal: AbortSignal.timeout(20000),
+  });
+  return r.json();
+}
+
+// Push the kernel (Run All / batch) with the requested accelerator. Returns the
+// parsed API response. device: "cpu" | "gpu".
+async function kaggleWake(env, device) {
+  // Pull current source + metadata so we re-push faithfully, only flipping GPU.
+  const pull = await kaggleGet(env, `/kernels/pull/${env.KAGGLE_KERNEL}`);
+  const meta = typeof pull.metadata === "string" ? JSON.parse(pull.metadata) : pull.metadata;
+  const source = pull.blob?.source ?? "";
+
+  const [owner, slug] = env.KAGGLE_KERNEL.split("/");
+  const body = {
+    id: meta.id,
+    slug: env.KAGGLE_KERNEL,
+    newTitle: meta.title || slug,
+    text: source,
+    language: "python",
+    kernelType: meta.kernelType || "notebook",
+    isPrivate: meta.isPrivate ?? false,
+    enableGpu: device === "gpu",
+    enableTpu: false,
+    enableInternet: true, // required to download the model + open the tunnel
+    datasetDataSources: meta.datasetDataSources || [],
+    competitionDataSources: meta.competitionDataSources || [],
+    kernelDataSources: meta.kernelDataSources || [],
+    modelDataSources: meta.modelDataSources || [],
+    categoryIds: meta.categoryIds || [],
+  };
+
+  const r = await fetch("https://www.kaggle.com/api/v1/kernels/push", {
+    method: "POST",
+    headers: {
+      authorization: kaggleAuth(env),
+      accept: "application/json",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(30000),
+  });
+  return { status: r.status, body: await r.json() };
+}
+
 
 async function activeBackend(env) {
   const record = await env.BACKEND_KV.get(BACKEND_KEY, "json");
@@ -220,6 +283,63 @@ async function handleCallback(env, ctx, cq) {
     return;
   }
 
+  if (data.startsWith("wake:")) {
+    const device = data.slice(5) === "gpu" ? "gpu" : "cpu";
+    // If a backend is already live, no need to wake.
+    const existing = await activeBackend(env);
+    if (existing) {
+      ctx.waitUntil(answerCallback(env, cq.id, "Backend already online."));
+      ctx.waitUntil(reply(env, chatId, "✅ Backend is already online.", mainMenu(env, existing)));
+      return;
+    }
+    if (!kaggleConfigured(env)) {
+      ctx.waitUntil(answerCallback(env, cq.id, "Kaggle API not configured."));
+      return;
+    }
+    ctx.waitUntil(answerCallback(env, cq.id, `Waking on ${device.toUpperCase()}…`));
+    ctx.waitUntil((async () => {
+      try {
+        const { status, body } = await kaggleWake(env, device);
+        if (status >= 200 && status < 300) {
+          await reply(env, chatId,
+            `🚀 Kaggle run started on ${device.toUpperCase()}. It takes ~3-5 min to download the model and register.\n` +
+            `Tap 📊 Status in a few minutes; when online you can generate.`);
+        } else {
+          await reply(env, chatId,
+            `Wake failed (${status}): ${body?.message || JSON.stringify(body).slice(0, 200)}`);
+        }
+      } catch (e) {
+        await reply(env, chatId, `Wake error: ${String(e).slice(0, 200)}`);
+      }
+    })());
+    return;
+  }
+
+  if (data === "stop") {
+    const backend = await activeBackend(env);
+    if (!backend) {
+      ctx.waitUntil(answerCallback(env, cq.id, "No live backend."));
+      ctx.waitUntil(env.BACKEND_KV.delete(BACKEND_KEY));
+      return;
+    }
+    ctx.waitUntil(answerCallback(env, cq.id, "Stopping…"));
+    ctx.waitUntil((async () => {
+      try {
+        await fetch(`${backend.url}/shutdown`, {
+          method: "POST",
+          signal: AbortSignal.timeout(10000),
+        });
+      } catch {
+        // The process may exit before responding — that's expected.
+      }
+      // Drop the registration so the menu flips back to Wake buttons.
+      await env.BACKEND_KV.delete(BACKEND_KEY);
+      await reply(env, chatId, "🛑 Session stopping. The Kaggle run will end shortly, freeing quota.",
+        mainMenu(env, null));
+    })());
+    return;
+  }
+
   ctx.waitUntil(answerCallback(env, cq.id));
 }
 
@@ -265,6 +385,48 @@ async function handleMessage(env, ctx, message) {
   if (command === "/generate") {
     const msg = await submitGeneration(env, chatId, argument);
     ctx.waitUntil(reply(env, chatId, msg));
+    return;
+  }
+
+  if (command === "/wake") {
+    const device = argument.trim().toLowerCase() === "gpu" ? "gpu" : "cpu";
+    if (!kaggleConfigured(env)) {
+      ctx.waitUntil(reply(env, chatId, "Kaggle API is not configured on this Worker."));
+      return;
+    }
+    const existing = await activeBackend(env);
+    if (existing) {
+      ctx.waitUntil(reply(env, chatId, "✅ Backend is already online.", mainMenu(env, existing)));
+      return;
+    }
+    ctx.waitUntil((async () => {
+      try {
+        const { status, body } = await kaggleWake(env, device);
+        await reply(env, chatId,
+          status >= 200 && status < 300
+            ? `🚀 Kaggle run started on ${device.toUpperCase()}. ~3-5 min to be ready; tap 📊 Status.`
+            : `Wake failed (${status}): ${body?.message || JSON.stringify(body).slice(0, 200)}`);
+      } catch (e) {
+        await reply(env, chatId, `Wake error: ${String(e).slice(0, 200)}`);
+      }
+    })());
+    return;
+  }
+
+  if (command === "/stop") {
+    const backend = await activeBackend(env);
+    if (!backend) {
+      ctx.waitUntil(env.BACKEND_KV.delete(BACKEND_KEY));
+      ctx.waitUntil(reply(env, chatId, "No live backend to stop.", mainMenu(env, null)));
+      return;
+    }
+    ctx.waitUntil((async () => {
+      try {
+        await fetch(`${backend.url}/shutdown`, { method: "POST", signal: AbortSignal.timeout(10000) });
+      } catch {}
+      await env.BACKEND_KV.delete(BACKEND_KEY);
+      await reply(env, chatId, "🛑 Session stopping — quota freed.", mainMenu(env, null));
+    })());
     return;
   }
 

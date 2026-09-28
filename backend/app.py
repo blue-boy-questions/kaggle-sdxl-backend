@@ -239,6 +239,19 @@ def set_device(payload: DeviceRequest):
     return {"ok": True, "device": effective}
 
 
+@app.post("/shutdown")
+def shutdown():
+    """Terminate this backend process, which ends the hosting Kaggle/Colab
+    session and stops consuming any quota. Best-effort: we clear the KV
+    registration is the Worker's job; here we just exit hard after replying.
+    A background timer calls os._exit so the HTTP response is flushed first."""
+    def _die():
+        time.sleep(1)
+        os._exit(0)
+    threading.Thread(target=_die, daemon=True).start()
+    return {"ok": True, "message": "backend shutting down"}
+
+
 @app.post("/generate", status_code=202)
 async def generate(payload: GenerateRequest):
     if PIPELINE is None:

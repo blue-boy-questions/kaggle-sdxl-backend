@@ -85,3 +85,26 @@ test("main menu has no web_app / device toggle without a backend", () => {
   assert.equal(flat.find((b) => b.web_app), undefined);
   assert.equal(flat.find((b) => b.callback_data && b.callback_data.startsWith("dev:")), undefined);
 });
+
+test("live backend menu includes a Stop button", () => {
+  const flat = mainMenu({}, { url: "https://x.trycloudflare.com", device: "cuda" })
+    .reply_markup.inline_keyboard.flat();
+  const stop = flat.find((b) => b.callback_data === "stop");
+  assert.ok(stop, "expected a Stop session button");
+  assert.match(stop.text, /Stop/);
+});
+
+test("offline menu shows Wake buttons when Kaggle is configured", () => {
+  const env = { KAGGLE_USERNAME: "u", KAGGLE_KEY: "k", KAGGLE_KERNEL: "u/n" };
+  const flat = mainMenu(env, null).reply_markup.inline_keyboard.flat();
+  const wakeCpu = flat.find((b) => b.callback_data === "wake:cpu");
+  const wakeGpu = flat.find((b) => b.callback_data === "wake:gpu");
+  assert.ok(wakeCpu && wakeGpu, "expected CPU and GPU wake buttons");
+  assert.match(wakeCpu.text, /CPU/);
+  assert.match(wakeGpu.text, /GPU/);
+});
+
+test("offline menu without Kaggle config shows no wake buttons", () => {
+  const flat = mainMenu({}, null).reply_markup.inline_keyboard.flat();
+  assert.equal(flat.find((b) => b.callback_data && b.callback_data.startsWith("wake:")), undefined);
+});
