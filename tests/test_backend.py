@@ -115,3 +115,23 @@ def test_deliver_to_telegram_sends_photo_and_schedules_deletion(monkeypatch, tmp
     # Both the photo (111) and the warning (222) are scheduled for deletion.
     assert started.get("started") is True
     assert started["args"] == ([111, 222],)
+
+
+def test_health_reports_device():
+    with TestClient(backend.app) as client:
+        body = client.get("/health").json()
+        assert "device" in body
+        assert body["device"] in ("cpu", "cuda")
+
+
+def test_device_switch_requires_loaded_model():
+    # With no pipeline loaded, /device returns 503.
+    with TestClient(backend.app) as client:
+        resp = client.post("/device", json={"device": "cpu"})
+        assert resp.status_code == 503
+
+
+def test_device_request_rejects_bad_value():
+    with TestClient(backend.app) as client:
+        # 'tpu' is not a permitted device -> 422 from the pattern validator.
+        assert client.post("/device", json={"device": "tpu"}).status_code == 422

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { allowedUser, parseCommand, validateGenerate, miniAppButton } from "../worker/src/index.js";
+import { allowedUser, parseCommand, validateGenerate, mainMenu } from "../worker/src/index.js";
 
 test("parses commands and bot suffixes", () => {
   assert.deepEqual(parseCommand(" /generate@image_bot a blue fox "), {
@@ -52,14 +52,36 @@ test("generation defaults and bounds", () => {
   );
 });
 
-test("mini app button builds a web_app pointing at /app", () => {
-  const btn = miniAppButton({ url: "https://abc.trycloudflare.com" });
-  const kb = btn.reply_markup.inline_keyboard[0][0];
-  assert.equal(kb.web_app.url, "https://abc.trycloudflare.com/app");
-  assert.match(kb.text, /Web App/);
+test("main menu shows glass Generate + Status buttons", () => {
+  const menu = mainMenu({}, null);
+  const rows = menu.reply_markup.inline_keyboard;
+  assert.equal(rows[0][0].callback_data, "gen");
+  assert.match(rows[0][0].text, /Generate/);
+  assert.equal(rows[1][0].callback_data, "status");
 });
 
-test("mini app button is empty without a live backend", () => {
-  assert.deepEqual(miniAppButton(null), {});
-  assert.deepEqual(miniAppButton({}), {});
+test("main menu offers Web App + a device toggle when backend is live", () => {
+  const menu = mainMenu({}, { url: "https://abc.trycloudflare.com", device: "cuda" });
+  const flat = menu.reply_markup.inline_keyboard.flat();
+  // Web App button points at /app
+  const webapp = flat.find((b) => b.web_app);
+  assert.equal(webapp.web_app.url, "https://abc.trycloudflare.com/app");
+  // On GPU, the toggle offers switching to CPU
+  const toggle = flat.find((b) => b.callback_data && b.callback_data.startsWith("dev:"));
+  assert.equal(toggle.callback_data, "dev:cpu");
+  assert.match(toggle.text, /CPU/);
+});
+
+test("device toggle flips to GPU when on CPU", () => {
+  const menu = mainMenu({}, { url: "https://x.trycloudflare.com", device: "cpu" });
+  const toggle = menu.reply_markup.inline_keyboard.flat()
+    .find((b) => b.callback_data && b.callback_data.startsWith("dev:"));
+  assert.equal(toggle.callback_data, "dev:cuda");
+  assert.match(toggle.text, /GPU/);
+});
+
+test("main menu has no web_app / device toggle without a backend", () => {
+  const flat = mainMenu({}, null).reply_markup.inline_keyboard.flat();
+  assert.equal(flat.find((b) => b.web_app), undefined);
+  assert.equal(flat.find((b) => b.callback_data && b.callback_data.startsWith("dev:")), undefined);
 });

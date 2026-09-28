@@ -17,6 +17,10 @@ RETENTION_SECONDS = int(os.getenv("RETENTION_SECONDS", "3600"))
 # chat_id, the backend uploads the finished PNG directly via sendPhoto. This
 # closes the loop without the Worker polling or holding a request open.
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+# Device the pipeline currently runs on ("cuda" or "cpu"). Set by set_pipeline
+# and switchable at runtime via /device so you can fall back to CPU (slow but
+# free, burns no GPU quota) without reloading the model.
+DEVICE = "cpu"
 JOBS: dict[str, dict[str, Any]] = {}
 QUEUE: asyncio.Queue = asyncio.Queue(maxsize=8)
 PIPELINE = None
@@ -48,9 +52,36 @@ class GenerateRequest(BaseModel):
 app = FastAPI(title="SDXL IP-Adapter ephemeral backend")
 
 
-def set_pipeline(pipeline) -> None:
-    global PIPELINE
+def set_pipeline(pipeline, device: str | None = None) -> None:
+    global PIPELINE, DEVICE
     PIPELINE = pipeline
+    if device:
+        DEVICE = device
+    else:
+        # Infer from the model's current device.
+        try:
+            DEVICE = "cuda" if next(pipeline.unet.parameters()).is_cuda else "cpu"
+        except Exception:
+            DEVICE = "cpu"
+
+
+def move_pipeline(device: str) -> str:
+    """Move the loaded pipeline to 'cuda' or 'cpu' at runtime. Returns the
+    device actually in effect. Used by /device so you can drop to CPU (free, no
+    GPU quota) or back to GPU without reloading weights."""
+    global DEVICE
+    if PIPELINE is None:
+        raise RuntimeError("model pipeline is not loaded")
+    device = device.lower().strip()
+    if device not in ("cuda", "cpu"):
+        raise ValueError("device must be 'cuda' or 'cpu'")
+    if device == "cuda":
+        import torch
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is not available in this runtime")
+    PIPELINE.to(device)
+    DEVICE = device
+    return DEVICE
 
 
 def cleanup() -> None:
@@ -66,7 +97,8 @@ def run_generation(job_id: str, payload: GenerateRequest) -> Path:
     if PIPELINE is None:
         raise RuntimeError("model pipeline is not loaded")
     import torch
-    generator = None if payload.seed == -1 else torch.Generator(device="cpu").manual_seed(payload.seed)
+    gen_device = "cuda" if DEVICE == "cuda" else "cpu"
+    generator = None if payload.seed == -1 else torch.Generator(device=gen_device).manual_seed(payload.seed)
     # set_ip_adapter_scale only applies when an IP-Adapter is actually loaded.
     # For pure text-to-image the adapter is off, so guard the call.
     try:
@@ -187,7 +219,24 @@ async def startup() -> None:
 
 @app.get("/health")
 def health():
-    return {"ok": True, "model_loaded": PIPELINE is not None, "queue_size": QUEUE.qsize()}
+    return {"ok": True, "model_loaded": PIPELINE is not None, "queue_size": QUEUE.qsize(), "device": DEVICE}
+
+
+class DeviceRequest(BaseModel):
+    device: str = Field(pattern="^(cuda|cpu)$")
+
+
+@app.post("/device")
+def set_device(payload: DeviceRequest):
+    """Switch the pipeline between GPU and CPU at runtime. CPU is slow (minutes
+    per image) but free and burns no GPU quota."""
+    if PIPELINE is None:
+        raise HTTPException(503, "model pipeline is not loaded")
+    try:
+        effective = move_pipeline(payload.device)
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc))
+    return {"ok": True, "device": effective}
 
 
 @app.post("/generate", status_code=202)

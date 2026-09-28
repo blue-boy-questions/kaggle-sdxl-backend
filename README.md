@@ -74,9 +74,15 @@ the Worker must already be deployed.
 A Kaggle session stays alive up to ~9 hours; the keep-alive cell holds the kernel
 busy so the tunnel stays registered. Interrupt it to shut down.
 
-## Bot commands
+## Bot commands & glass buttons
 
-- `/start`, `/help`, `/status`, `/generate <prompt>`
+- `/start`, `/help` — show the glass (inline) menu.
+- Tap **🎨 Generate**, then send your prompt as the next message.
+- `/generate <prompt>` — one-shot generation.
+- **📊 Status** — backend online/offline + current device.
+- **🐢 Switch to CPU / ⚡ Switch to GPU** — flip the render device at runtime.
+  CPU is free and burns no GPU quota but takes minutes per image; GPU is fast.
+- **🖼 Open Web App** — opens the Gradio UI as a Telegram Mini App (private chat).
 
 ## Model is NOT in this repo
 

@@ -1,6 +1,7 @@
 const BACKEND_KEY = "active_backend";
 const MAX_PROMPT_LENGTH = 1000;
 const DEFAULT_BACKEND_TTL = 7200;
+const PENDING_TTL = 300; // seconds a "waiting for your prompt" state lives
 
 export function allowedUser(env, userId) {
   const configured = (env.ALLOWED_TELEGRAM_USER_IDS || "").trim();
@@ -56,30 +57,27 @@ function reply(env, chatId, text, extra = {}) {
   return telegram(env, "sendMessage", { chat_id: chatId, text, ...extra });
 }
 
-// Inline keyboard linking to the Colab notebook so the user can cold-start the
-// free backend with one tap. COLAB_NOTEBOOK_URL is an optional [vars] entry.
-function colabButton(env) {
-  const url = (env.COLAB_NOTEBOOK_URL || "").trim();
-  if (!url) return {};
-  return {
-    reply_markup: {
-      inline_keyboard: [[{ text: "▶️ Open Colab backend", url }]],
-    },
-  };
+function answerCallback(env, callbackId, text = "") {
+  return telegram(env, "answerCallbackQuery", { callback_query_id: callbackId, text });
 }
 
-// Telegram Mini App button opening the Gradio UI served on the live backend
-// tunnel at `<backend.url>/app`. web_app requires an https URL (the Cloudflare
-// Quick Tunnel is https) and only renders in private chats.
-export function miniAppButton(backend) {
-  if (!backend?.url) return {};
-  return {
-    reply_markup: {
-      inline_keyboard: [[
-        { text: "🎨 Open Web App", web_app: { url: `${backend.url}/app` } },
-      ]],
-    },
-  };
+// Glass (inline) main menu. Buttons carry callback_data the Worker handles;
+// the Web App button only renders when a live backend/tunnel exists.
+export function mainMenu(env, backend) {
+  const rows = [
+    [{ text: "🎨 Generate", callback_data: "gen" }],
+    [{ text: "📊 Status", callback_data: "status" }],
+  ];
+  if (backend?.url) {
+    const dev = backend.device === "cuda" ? "cpu" : "cuda";
+    const label = dev === "cpu" ? "🐢 Switch to CPU (free)" : "⚡ Switch to GPU";
+    rows.push([{ text: label, callback_data: `dev:${dev}` }]);
+    rows.push([{ text: "🖼 Open Web App", web_app: { url: `${backend.url}/app` } }]);
+  } else {
+    const colab = (env.COLAB_NOTEBOOK_URL || "").trim();
+    if (colab) rows.push([{ text: "▶️ Start backend (Kaggle/Colab)", url: colab }]);
+  }
+  return { reply_markup: { inline_keyboard: rows } };
 }
 
 async function activeBackend(env) {
@@ -94,6 +92,35 @@ async function activeBackend(env) {
   } catch {
     return null;
   }
+}
+
+// Submit a validated prompt to the live backend. Returns a user-facing message.
+async function submitGeneration(env, chatId, promptText) {
+  let payload;
+  try {
+    payload = validateGenerate({ prompt: promptText });
+  } catch (error) {
+    return `Invalid request: ${error.message}`;
+  }
+
+  const backend = await activeBackend(env);
+  if (!backend) {
+    return "Generation is offline. Start the backend first (Kaggle Run All), then retry.";
+  }
+
+  const response = await fetch(`${backend.url}/generate`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    // chat_id lets the backend push the finished PNG directly via sendPhoto.
+    body: JSON.stringify({ ...payload, chat_id: chatId }),
+    signal: AbortSignal.timeout(10000),
+  });
+
+  if (!response.ok) {
+    return "The backend rejected the generation request.";
+  }
+  await response.json();
+  return "🖌 Generating your image — it will arrive here shortly.";
 }
 
 async function registerBackend(request, env) {
@@ -119,6 +146,7 @@ async function registerBackend(request, env) {
   );
   const record = {
     url: url.origin,
+    device: typeof body.device === "string" ? body.device : "unknown",
     expires_at: Date.now() + ttl * 1000,
   };
 
@@ -126,6 +154,121 @@ async function registerBackend(request, env) {
     expirationTtl: ttl,
   });
   return Response.json({ ok: true, ...record });
+}
+
+// Handle a tapped glass button.
+async function handleCallback(env, ctx, cq) {
+  const chatId = cq.message?.chat?.id;
+  const data = cq.data || "";
+
+  if (!allowedUser(env, cq.from?.id)) {
+    ctx.waitUntil(answerCallback(env, cq.id, "Access denied."));
+    return;
+  }
+
+  if (data === "gen") {
+    // Arm a "waiting for prompt" state; the next plain message becomes the prompt.
+    ctx.waitUntil(env.BACKEND_KV.put(`pending:${chatId}`, "1", { expirationTtl: PENDING_TTL }));
+    ctx.waitUntil(answerCallback(env, cq.id));
+    ctx.waitUntil(reply(env, chatId,
+      "✍️ Send me your prompt as a message now (e.g. `1girl, masterpiece, best quality`)."));
+    return;
+  }
+
+  if (data === "status") {
+    const backend = await activeBackend(env);
+    const dev = backend?.device && backend.device !== "unknown" ? ` (${backend.device.toUpperCase()})` : "";
+    ctx.waitUntil(answerCallback(env, cq.id));
+    ctx.waitUntil(reply(env, chatId,
+      backend ? `✅ Backend is online${dev}.` : "⚠️ Backend is offline. Start it, then retry.",
+      mainMenu(env, backend)));
+    return;
+  }
+
+  if (data.startsWith("dev:")) {
+    const target = data.slice(4);
+    const backend = await activeBackend(env);
+    if (!backend) {
+      ctx.waitUntil(answerCallback(env, cq.id, "Backend is offline."));
+      return;
+    }
+    try {
+      const resp = await fetch(`${backend.url}/device`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ device: target }),
+        signal: AbortSignal.timeout(15000),
+      });
+      const body = await resp.json();
+      if (!resp.ok) {
+        ctx.waitUntil(answerCallback(env, cq.id, body.detail || "Switch failed."));
+        return;
+      }
+      // Refresh the cached device so the menu label flips.
+      backend.device = body.device;
+      ctx.waitUntil(env.BACKEND_KV.put(BACKEND_KEY, JSON.stringify(backend),
+        { expirationTtl: Math.max(60, Math.floor((backend.expires_at - Date.now()) / 1000)) }));
+      ctx.waitUntil(answerCallback(env, cq.id, `Now running on ${body.device.toUpperCase()}`));
+      ctx.waitUntil(reply(env, chatId,
+        body.device === "cpu"
+          ? "🐢 Switched to CPU. Free, no GPU quota — but each image takes minutes."
+          : "⚡ Switched to GPU. Fast, but uses Kaggle GPU quota.",
+        mainMenu(env, backend)));
+    } catch {
+      ctx.waitUntil(answerCallback(env, cq.id, "Switch timed out."));
+    }
+    return;
+  }
+
+  ctx.waitUntil(answerCallback(env, cq.id));
+}
+
+async function handleMessage(env, ctx, message) {
+  const chatId = message.chat.id;
+  if (!allowedUser(env, message.from?.id)) {
+    ctx.waitUntil(reply(env, chatId, "Access denied."));
+    return;
+  }
+
+  const text = message.text || "";
+  const { command, argument } = parseCommand(text);
+
+  // Not a command? If we're waiting for a prompt (glass Generate was tapped),
+  // treat this message as the prompt.
+  if (!command.startsWith("/")) {
+    const pending = await env.BACKEND_KV.get(`pending:${chatId}`);
+    if (pending) {
+      ctx.waitUntil(env.BACKEND_KV.delete(`pending:${chatId}`));
+      const msg = await submitGeneration(env, chatId, text);
+      ctx.waitUntil(reply(env, chatId, msg));
+    }
+    return;
+  }
+
+  if (command === "/start" || command === "/help") {
+    const backend = await activeBackend(env);
+    ctx.waitUntil(reply(env, chatId,
+      "Welcome! Tap 🎨 Generate and then send your prompt, or use /generate <prompt> directly.",
+      mainMenu(env, backend)));
+    return;
+  }
+
+  if (command === "/status") {
+    const backend = await activeBackend(env);
+    const dev = backend?.device && backend.device !== "unknown" ? ` (${backend.device.toUpperCase()})` : "";
+    ctx.waitUntil(reply(env, chatId,
+      backend ? `✅ Backend is online${dev}.` : "⚠️ Backend is offline. Start it, then retry.",
+      mainMenu(env, backend)));
+    return;
+  }
+
+  if (command === "/generate") {
+    const msg = await submitGeneration(env, chatId, argument);
+    ctx.waitUntil(reply(env, chatId, msg));
+    return;
+  }
+
+  ctx.waitUntil(reply(env, chatId, "Unknown command. Use /help.", mainMenu(env, null)));
 }
 
 async function webhook(request, env, ctx) {
@@ -137,87 +280,16 @@ async function webhook(request, env, ctx) {
   }
 
   const update = await request.json();
-  const message = update.message;
-  if (!message?.text) return Response.json({ ok: true });
 
-  const chatId = message.chat.id;
-  if (!allowedUser(env, message.from?.id)) {
-    ctx.waitUntil(reply(env, chatId, "Access denied."));
+  if (update.callback_query) {
+    await handleCallback(env, ctx, update.callback_query);
     return Response.json({ ok: true });
   }
 
-  const { command, argument } = parseCommand(message.text);
-  let task;
-
-  if (command === "/start" || command === "/help") {
-    task = (async () => {
-      const backend = await activeBackend(env);
-      // Prefer the Mini App button when a backend is live; otherwise offer the
-      // Colab cold-start link.
-      const buttons = backend ? miniAppButton(backend) : colabButton(env);
-      return reply(
-        env,
-        chatId,
-        "Commands:\n/status\n/generate <prompt>\n\nThe free Colab backend must be started manually before generation. When it is online, tap the button below to open the web app.",
-        buttons,
-      );
-    })();
-  } else if (command === "/status") {
-    task = activeBackend(env).then((backend) =>
-      backend
-        ? reply(env, chatId, "Backend is online. Tap below to open the web app.", miniAppButton(backend))
-        : reply(
-            env,
-            chatId,
-            "Backend is offline. Tap below to start the Colab notebook, run the cells, then retry.",
-            colabButton(env),
-          ),
-    );
-  } else if (command === "/generate") {
-    task = (async () => {
-      let payload;
-      try {
-        payload = validateGenerate({ prompt: argument });
-      } catch (error) {
-        return reply(env, chatId, `Invalid request: ${error.message}`);
-      }
-
-      const backend = await activeBackend(env);
-      if (!backend) {
-        return reply(
-          env,
-          chatId,
-          "Generation is offline. Tap below to start the Colab notebook, run the cells, then retry.",
-          colabButton(env),
-        );
-      }
-
-      // Attach the chat id so the backend delivers the finished PNG directly
-      // via sendPhoto — the Worker cannot hold a request open long enough to
-      // poll for a multi-second SDXL generation.
-      const response = await fetch(`${backend.url}/generate`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ ...payload, chat_id: chatId }),
-        signal: AbortSignal.timeout(10000),
-      });
-
-      if (!response.ok) {
-        return reply(env, chatId, "The backend rejected the generation request.");
-      }
-
-      await response.json();
-      return reply(
-        env,
-        chatId,
-        "Generating your image — it will arrive here shortly.",
-      );
-    })();
-  } else {
-    task = reply(env, chatId, "Unknown command. Use /help.");
+  const message = update.message;
+  if (message?.text) {
+    await handleMessage(env, ctx, message);
   }
-
-  ctx.waitUntil(task);
   return Response.json({ ok: true });
 }
 
