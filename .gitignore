@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Runtime artifacts / model weights (never commit the checkpoint)
+*.safetensors
+*.ckpt
+*.bin
+*.pt
+sdxl_outputs/
+model.safetensors

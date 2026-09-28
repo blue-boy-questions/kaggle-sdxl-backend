@@ -1,0 +1,8 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.12
+pillow==10.4.0
+requests==2.32.3
+gradio==4.44.0
+# The notebook installs Colab-compatible torch, diffusers, transformers,
+# accelerate, and safetensors into the temporary runtime.
